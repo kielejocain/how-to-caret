@@ -1,0 +1,306 @@
+---
+title: "Data Modeling with Caret"
+author: "Kyle Joecken"
+date: "November 14, 2015"
+output: pdf_document
+---
+
+# Part 1: Machine Learning in R Without `caret`
+
+## A simple machine learning example that does not take advantage of `caret`
+
+First, we load the required libraries and read our data into data frames. The following data (and most of the code) come from kaggle's introductory "Digit Recognizer" optical character recognition problem.
+
+```{r, message=FALSE, warning=FALSE}
+library(randomForest)
+trainData <- read.csv("data/digits/train.csv")
+trainData$label <- as.factor(trainData$label)
+testData <- read.csv("data/digits/test.csv")
+```
+
+Let's verify that the data look properly loaded, and inspect the format.
+
+```{r}
+dim(trainData); dim(testData); str(trainData[, 1:6])
+```
+
+We see that the first column (`label`) is the actual digit represented by an image, and the remaining 784 columns are greyscale values for each pixel in the 28x28 images.
+
+After setting the seed to keep our results repeatable, we select a random subsample of our data and pull the predictors from the outcome.
+
+```{r}
+set.seed(0)
+numTrain <- 10000
+rows <- sample(1:nrow(trainData), numTrain)
+labels <- as.factor(trainData[rows,1])
+subtrain <- trainData[rows,-1]
+```
+
+Finally, we build a random forest model on the subset of the `train` data set, computing the predicted outcomes of the test set along the way.  The actual [`randomForest`](http://www.inside-r.org/packages/cran/randomforest/docs/randomforest) function is called with four arguments, though only the first is necessary.
+
+`randomForest(x, y=NULL, xtest=NULL, ntree=500)`
+
+There are over a dozen additional potential parameters to pass, including `mtry`, the number of predictors to randomly sample at each break point.
+
+```{r}
+numTrees <- 25
+rf <- randomForest(subtrain, labels, xtest=testData, ntree=numTrees)
+predictions <- data.frame(
+    ImageId=1:nrow(testData),
+    Label=levels(labels)[rf$test$predicted]
+)
+head(predictions)
+```
+
+This went rather smoothly.  But:
+
+- What if I want to reserve my own data set for validation before predicting on the test set?
+- What if I want further details on factor selection done by the model?
+- What if I simply want to try a different model?
+
+`caret` helps will all of these things and more.
+
+# Part 2: Data and Model Exploration in `caret`
+
+## Variable importance and parameter tuning
+
+Let's improve upon kaggle's example model by applying some of `caret`'s functionality.  We begin by loading the `caret` package.  We will simultaneously load a parallel processing package `doMC` and tell it how many cores we're rocking (the Mac on which I wrote this has four cores with two threads each).  For those packages that implement some form of parallelization, `caret` does not interfere.  `randomForest` is definitely one of those packages.
+
+See the [`caret` documentation](http://topepo.github.io/caret/parallel.html) for additional information.
+
+```{r, message=FALSE, warning=FALSE}
+library(caret)
+library(doMC)
+registerDoMC(8)
+```
+
+## `createDataPartition`
+
+The first function we will want to learn is `caret`'s data partitioning function.  Here is the function call from the [documentation](http://www.inside-r.org/node/87010):
+
+    createDataPartition(
+        y, 
+        times = 1,
+        p = 0.5,
+        list = TRUE,
+        groups = min(5, length(y))
+    )
+
+This function takes `times` samples from your data vector `y` of proportion `p`.  If your data are discrete, `createDataPartition` will automatically take a representative sample from each level as best as it can; otherwise, you can use `groups` to help `caret` partition a continuous variable.
+
+The values returned are chosen indices from `y`.
+
+##`train`
+
+This function trains your model.  Again from the slimmed down [docs](http://www.inside-r.org/packages/cran/caret/docs/train):
+
+    train(
+        x,
+        y, 
+        method = "rf",
+        ... 
+    )
+
+This call returns a `train` object, which is basically a list.  The model contained is built applying the given `method` (in this case `"rf"` means random forest) to the predictors in the data frame `x` and with associated vector of outcomes `y`.  As `caret` is really just a wrapper for the underlying packages that deploy varous methods, we can pass additional arguments through the ellipses as needed.
+
+Let's have a look at an example.  These lines are nearly identical to those from kaggle's "benchmark" code.  A few things are different:
+
+- I want to plot soon, so I reduced from a sample of 10,000 to one of about 1,000
+- I asked `randomForest` to keep track of importance variables, which it does not do by default
+
+You can see that we pass `list=FALSE` to `createDataPartition`; as we only have one sample, we'd like to have our row numbers in a vector so that we can easily subset our data with it.  We also used the formula implementation of the `train` function rather than slice the data frame via `train(naiveData[, -1], naive$label, ...)`.
+
+```{r}
+set.seed(0)
+inTrain <- createDataPartition(trainData$label, p=1/40, list=FALSE)
+naiveData <- trainData[inTrain, ]
+naiveModel <- train(
+    label ~ .,
+    data = naiveData,
+    method="rf",
+    ntree=25,
+    importance=TRUE
+)
+```
+
+## `varImp`
+
+Since we've asked `randomForest` to keep track of importance, let's have a look at it.  The `varImp` function computes importance on a scale from 0 to 100 (by default--set `scale=FALSE` to return the raw score used).
+
+```{r}
+varImp(naiveModel)
+```
+
+## `featurePlot`
+
+A wrapper for various `lattice` plots.  Once more, the call string from [documentation](http://www.inside-r.org/packages/cran/caret/docs/featurePlot):
+
+    featurePlot(
+        x,
+        y, 
+        plot = if(is.factor(y)) "strip" else "scatter",
+        ...
+    )
+
+As before, `x` holds the predictor data frame and `y` holds the outcome vector.  `plot` is a string corresponding to the type of plot you want (e.g., `"pairs"`).  `...` implies that you can add additional arguments to be passed down to the `lattice` plot call.
+
+```{r}
+featurePlot(
+    x = naiveData[, c(320, 380, 432, 543, 600, 1)],
+    y = naiveData$label,
+    plot = "pairs",
+    alpha = 1/20,
+    auto.key = list(columns = 10)
+)
+```
+
+## train(tuneGrid)
+
+As an optional argument to pass to `train`, `tuneGrid` allows you to pass in various combinations of hyperparameters to your model in an effort to optimize them.  The [`caret` documentation](http://topepo.github.io/caret/training.html#grids) has a nice example that demonstrates how you make a simple matrix of hyperparameter combinations, save it as a named matrix, and pass that in as the `tuneGrid` argument.
+
+If you want to know what hyperparameters a particular method takes, simply call the `modelLookup` function (e.g., `modelLookup("rf")`).  What returns will be a printout of each hyperparameter by name, description, and some indicators of its intended use.  For additional details, you'll need to check the documentation of the underlying package.
+
+**Note:** You must name your tuning grid!  `caret` will get angry if you try to pass in a call to `expand.grid`.
+
+For `randomForest` (`method="rf"`), there is only one hyperparameter: `mtry`.  This tells `randomForest` how many of the predictors to try and split on at each node.  By default, `randomForest` takes a random sample of the square root of the total and tries to split on those.  In our case, 28 x 28 = 784 pixels means the default is 28 pixels chosen at each split.  But what if that isn't best?
+
+```{r}
+set.seed(12345)
+inTrain <- createDataPartition(trainData$label, p=0.5, list=FALSE)
+fitGrid <- expand.grid(
+    mtry = (1:8) * 10 - 2
+)
+rfModel <- train(
+    label ~ .,
+    data = trainData[inTrain, ],
+    method="rf",
+    tuneGrid=fitGrid,
+    ntree=25
+)
+```
+
+If you ask `R` to print the `train` object, it outputs a nice summary that includes (within reason) a list of the parameter combinations and the resulting 'quality' metrics (these can be changed).
+
+```{r}
+print(rfModel)
+```
+
+Similarly, if you plot a `train` object, you get a graph of your metric against your hyperparameter(s).
+
+```{r}
+plot(rfModel)
+```
+
+Do you like `ggplot2`?  So does `caret`!
+
+```{r}
+ggplot(rfModel)
+```
+
+# Part 3: Model Validation
+
+## Tuning and performance
+
+In this final section, we'd like to look at a few tools that can help validate and analyze your models.  For a classification task, the most obvious such tool is the [confusion matrix](https://en.wikipedia.org/wiki/Confusion_matrix).  Perhaps unsurprisingly, `caret` has an aptly-named helper function.
+
+## confusionMatrix.train
+
+`caret`'s `confusionMatrix` function has two iterations, and the first applies to a `train` object.  Assuming that the outcomes of the method call were explicitly discrete, calling `confusionMatrix(myModel)` will return a simple diagram that shows how frequently each level was guessed correctly or confused for a different level.  This is simply a finer level of detail on the accuracy score we've already been shown by printing the `train` object directly.
+
+```{r}
+confusionMatrix(rfModel)
+```
+
+## predict
+
+What if we want to know how the model performs on data it wasn't trained on?  We'll need to apply it to other data we've been holding back (the point of `createDataPartition`), and compare that to truth values for those data.  Once again to the [docs](http://www.inside-r.org/packages/cran/caret/docs/extractPrediction):
+
+    predict(
+        object,
+        newdata = NULL,
+        ...
+    )
+
+Here, `object` is the `train` object we're using to predict, and `newdata` is a data frame containing the withheld data.  As with other `caret` functions, this is essentially a wrapper for the prediction functions of the various packages, so additional arguments are ocassionally necessary and can be passed through the ellipsis.
+
+```{r}
+rfValidData <- predict(rfModel, trainData[-inTrain, ])
+```
+
+## confusionMatrix
+
+Now that we have used our model to predict the outcomes for new data, we'll want to compare that to the known truth values.  This is the other (perhaps more useful) version of `confuseMatrix`.  As usual, the [docs](http://www.inside-r.org/node/86995):
+
+    confusionMatrix(
+        data,
+        reference,
+        ...
+    )
+
+Here, `data` is a vector of newly predicted data and `reference` are the truth values.
+
+```{r}
+confusionMatrix(rfValidData, trainData[-inTrain, "label"])
+```
+
+## trainControl
+
+This is going rather well, but we have not yet considered how the model is validating itself as it trains.  By default, `caret` uses boostrap resampling; this can be changed, however.  Much like `tuneGrid`, there is a `trControl` argument to the `train` function that takes the output of the `trainControl` function (as documented [here](http://www.inside-r.org/packages/cran/caret/docs/trainControl)):
+
+    trainControl(
+        method = "boot", 
+        number = ifelse(method %in% c("cv", "repeatedcv"), 10, 25),
+        repeats = ifelse(method %in% c("cv", "repeatedcv"), 1, number,
+        ...
+    )
+
+You can set `method` to be a string like `"repeatedcv"` to change the resampling method, and pass additional parameters that suit your method.  I've mentioned the ones that have to do with repeated cross-validation, but there are many others in the docs if you are interested.
+
+```{r}
+set.seed(2967)
+inTrain <- createDataPartition(trainData$label, p = 0.5, list = FALSE)
+fitControl <- trainControl(
+    method = "repeatedcv",
+    number = 5,
+    repeats = 3
+)
+# hyperparameters must be passed through the tuneGrid argument, even if constant
+fitGrid <- expand.grid(mtry = 58)
+finalModel <- train(
+    label ~ .,
+    data = trainData[inTrain, ],
+    method = "rf",
+    trControl = fitControl,
+    tuneGrid = fitGrid
+)
+```
+
+How did we do this time?
+
+```{r}
+print(finalModel)
+```
+
+```{r}
+confusionMatrix(finalModel)
+```
+
+Is that just overfit?  How about on the other, reserve half of the data?
+
+```{r}
+validData <- predict(finalModel, trainData[-inTrain, ])
+confusionMatrix(validData, trainData[-inTrain, "label"])
+```
+
+# Part 4: Other Features
+
+## Additional Models
+
+- Is a random forest not appropriate for your modeling task?  There are over 200 other [models `caret` can handle](http://topepo.github.io/caret/modelList.html).
+- Don't see what you want?  Well, you'll get no help from me, but `caret` is capable of handling [custom models](http://topepo.github.io/caret/custom_models.html).
+
+## Additional additions
+
+- Instead of `createDataPartition` using the outcome, you can [split on the predictors](http://topepo.github.io/caret/splitting.html#predictors) using (for example) maximum dissimilarity.
+- You can also affect class subsampling by having `caret` [up- or down-sample](http://topepo.github.io/caret/sampling.html) so that underrepresented classes carry more weight in model training.
+- `caret` can help [pre-process your data](http://topepo.github.io/caret/preprocess.html), often from right inside the `train` function.
